@@ -20,12 +20,12 @@ import {
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
 const firebaseConfig = {
-  apiKey: "REPLACE_ME",
-  authDomain: "REPLACE_ME.firebaseapp.com",
-  projectId: "REPLACE_ME",
-  storageBucket: "REPLACE_ME.appspot.com",
-  messagingSenderId: "REPLACE_ME",
-  appId: "REPLACE_ME"
+  apiKey: "AIzaSyD7pzPD43o8wEEhBJVb5s0aUdBKRmVNeEQ",
+  authDomain: "finetracker-b3bce.firebaseapp.com",
+  projectId: "finetracker-b3bce",
+  storageBucket: "finetracker-b3bce.firebasestorage.app",
+  messagingSenderId: "705308338177",
+  appId: "1:705308338177:web:4e62cc10d3438205393800"
 };
 
 const app = initializeApp(firebaseConfig);
