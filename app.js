@@ -175,6 +175,22 @@ async function addTransaction(tx) {
   showToast("Entry added");
 }
 
+async function deleteTransaction(txId, cycleId) {
+  // Firestore arrayUnion has no "remove by predicate" — only arrayRemove with an
+  // exact-match object. Safer + simpler: read the doc, filter the array in JS,
+  // and write the whole array back. Rooms are tiny (two people, one cycle's
+  // worth of entries) so this is cheap.
+  const ref = fb.doc(fb.db, "rooms", state.room.code);
+  const snap = await fb.getDoc(ref);
+  if (!snap.exists()) return;
+  const data = snap.data();
+  const cycle = data.cycles[cycleId];
+  if (!cycle) return;
+  const updatedTxs = (cycle.transactions || []).filter(t => t.id !== txId);
+  await fb.updateDoc(ref, { [`cycles.${cycleId}.transactions`]: updatedTxs });
+  showToast("Entry deleted");
+}
+
 async function startNewCycle() {
   const ref = fb.doc(fb.db, "rooms", state.room.code);
   const newId = genCycleId();
@@ -191,6 +207,91 @@ async function startNewCycle() {
 }
 
 // ===========================================================
+// EXPORT (CSV — opens directly in Excel / Sheets / Numbers)
+// ===========================================================
+
+function listAllCycles() {
+  if (!state.room || !state.room.cycles) return [];
+  return Object.entries(state.room.cycles)
+    .map(([id, c]) => ({ id, ...c }))
+    .sort((a, b) => b.startedAt - a.startedAt);
+}
+
+function csvEscape(val) {
+  if (val === null || val === undefined) return "";
+  const s = String(val);
+  if (/[",\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+
+function buildCycleCsv(cycle) {
+  const txs = (cycle.transactions || []).slice().sort((a, b) => a.ts - b.ts);
+  const rows = [];
+
+  // ---- Summary block first, same spirit as her original Dashboard sheet ----
+  const members = state.room.members.map(m => m.name);
+  rows.push(["FineTracker export"]);
+  rows.push(["Room", state.room.code]);
+  rows.push(["Cycle started", new Date(cycle.startedAt).toLocaleString("en-IN")]);
+  rows.push(["Exported on", new Date().toLocaleString("en-IN")]);
+  rows.push([]);
+
+  rows.push(["Summary", "Income", "Expenses", "Savings", "Debt added", "Available balance"]);
+  const allSummary = summarizeTxs(txs, null);
+  rows.push(["Combined", allSummary.income, allSummary.expense, allSummary.savings, allSummary.debt, allSummary.available]);
+  for (const name of members) {
+    const s = summarizeTxs(txs, name);
+    rows.push([name, s.income, s.expense, s.savings, s.debt, s.available]);
+  }
+  rows.push([]);
+
+  // ---- Full transaction log ----
+  rows.push(["Date", "Time", "By", "Type", "Category", "Subcategory", "Amount", "Note"]);
+  for (const t of txs) {
+    const d = new Date(t.ts);
+    rows.push([
+      d.toLocaleDateString("en-IN"),
+      d.toLocaleTimeString("en-IN"),
+      t.by,
+      cap(t.kind),
+      t.category || "",
+      t.subcategory || "",
+      t.amount,
+      t.note || ""
+    ]);
+  }
+
+  return rows.map(row => row.map(csvEscape).join(",")).join("\r\n");
+}
+
+function summarizeTxs(txs, byName) {
+  const list = byName ? txs.filter(t => t.by === byName) : txs;
+  let income = 0, expense = 0, savings = 0, debt = 0;
+  for (const t of list) {
+    if (t.kind === "income") income += t.amount;
+    else if (t.kind === "expense") expense += t.amount;
+    else if (t.kind === "savings") savings += t.amount;
+    else if (t.kind === "debt") debt += t.amount;
+  }
+  return { income, expense, savings, debt, available: income - expense - savings };
+}
+
+function downloadCycleCsv(cycle, cycleId) {
+  const csv = buildCycleCsv(cycle);
+  const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const dateLabel = new Date(cycle.startedAt).toLocaleDateString("en-IN", { month: "short", year: "numeric" }).replace(" ", "_");
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `FineTracker_${state.room.code}_${dateLabel}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+  showToast("Exported — check your Downloads");
+}
+
+// ===========================================================
 // DERIVED DATA / CALCULATIONS
 // ===========================================================
 
@@ -201,9 +302,10 @@ function getCurrentCycle() {
 }
 
 function getTx(filterBy) {
+  const cid = state.room.currentCycleId;
   const cycle = getCurrentCycle();
   if (!cycle) return [];
-  let txs = cycle.transactions || [];
+  let txs = (cycle.transactions || []).map(t => ({ ...t, cycleId: cid }));
   if (filterBy === "me") txs = txs.filter(t => t.by === state.me);
   if (filterBy === "partner") txs = txs.filter(t => t.by !== state.me);
   return txs.sort((a, b) => b.ts - a.ts);
@@ -230,6 +332,64 @@ function computeSummary(filterBy) {
 
 function computeCategoryBreakdown(filterBy, kind) {
   const txs = getTx(filterBy).filter(t => t.kind === kind);
+  const map = {};
+  for (const t of txs) {
+    const key = t.category || "Other";
+    map[key] = (map[key] || 0) + t.amount;
+  }
+  return Object.entries(map).sort((a, b) => b[1] - a[1]);
+}
+
+// ---------- Analytics: flatten transactions across ALL cycles ----------
+function getAllTxAcrossCycles(filterBy) {
+  if (!state.room || !state.room.cycles) return [];
+  let all = [];
+  for (const [cid, cycle] of Object.entries(state.room.cycles)) {
+    const txs = (cycle.transactions || []).map(t => ({ ...t, cycleId: cid }));
+    all = all.concat(txs);
+  }
+  if (filterBy === "me") all = all.filter(t => t.by === state.me);
+  if (filterBy === "partner") all = all.filter(t => t.by !== state.me);
+  return all;
+}
+
+function monthKey(ts) {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+function monthLabel(key) {
+  const [y, m] = key.split('-').map(Number);
+  return new Date(y, m - 1, 1).toLocaleDateString('en-IN', { month: 'short', year: '2-digit' });
+}
+
+// Returns last N months (chronological order) each with income/expense/savings/debt totals
+function computeMonthlySeries(filterBy, months = 6) {
+  const txs = getAllTxAcrossCycles(filterBy);
+  const byMonth = {};
+  for (const t of txs) {
+    const key = monthKey(t.ts);
+    if (!byMonth[key]) byMonth[key] = { income: 0, expense: 0, savings: 0, debt: 0 };
+    if (t.kind === 'income') byMonth[key].income += t.amount;
+    else if (t.kind === 'expense') byMonth[key].expense += t.amount;
+    else if (t.kind === 'savings') byMonth[key].savings += t.amount;
+    else if (t.kind === 'debt') byMonth[key].debt += t.amount;
+  }
+
+  // Build a continuous range of the last N months ending this month, even if
+  // some months have zero entries — keeps the chart's x-axis honest.
+  const now = new Date();
+  const series = [];
+  for (let i = months - 1; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    const vals = byMonth[key] || { income: 0, expense: 0, savings: 0, debt: 0 };
+    series.push({ key, label: monthLabel(key), ...vals });
+  }
+  return series;
+}
+
+function computeCategoryBreakdownAllTime(filterBy, kind) {
+  const txs = getAllTxAcrossCycles(filterBy).filter(t => t.kind === kind);
   const map = {};
   for (const t of txs) {
     const key = t.category || "Other";
@@ -358,6 +518,7 @@ function renderApp() {
   let body = "";
   if (state.nav === "home") body = renderHome(partnerName, waitingForPartner);
   else if (state.nav === "history") body = renderHistory();
+  else if (state.nav === "analytics") body = renderAnalytics(partnerName, waitingForPartner);
   else if (state.nav === "room") body = renderRoomTab(partnerName, waitingForPartner);
 
   return `
@@ -375,6 +536,7 @@ function renderBottomNav() {
   const tabs = [
     { id: "home", icon: "𝓛", label: "Ledger" },
     { id: "history", icon: "≡", label: "History" },
+    { id: "analytics", icon: "▲", label: "Analytics" },
     { id: "room", icon: "⚭", label: "Room" }
   ];
   return `<div class="bottom-nav">
@@ -449,13 +611,14 @@ function renderTxItem(t) {
   const cls = t.kind === 'income' ? 'pos' : t.kind === 'expense' ? 'neg' : '';
   const dateStr = new Date(t.ts).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' });
   return `
-    <div class="tx-item">
+    <div class="tx-item" data-txid="${t.id}" data-cycleid="${t.cycleId}">
       <div class="tx-icon ${t.kind}">${TX_ICON[t.kind]}</div>
       <div class="tx-body">
         <div class="tx-title">${t.category || cap(t.kind)}${t.subcategory ? ' · ' + t.subcategory : ''}</div>
         <div class="tx-sub">${t.by} · ${dateStr}${t.note ? ' · ' + t.note : ''}</div>
       </div>
       <div class="tx-amt ${cls}">${sign}₹${fmtMoney(t.amount)}</div>
+      <button class="tx-delete" data-deltx="${t.id}" data-delcycle="${t.cycleId}" aria-label="Delete entry">✕</button>
     </div>
   `;
 }
@@ -476,6 +639,77 @@ function renderHistory() {
     </div>
     ${txs.length ? txs.map(renderTxItem).join('') : `<div class="tx-empty">No entries yet.</div>`}
   `;
+}
+
+// ---------- ANALYTICS TAB ----------
+let analyticsMetric = "expense"; // expense | income | savings | debt
+
+function renderAnalytics(partnerName, waiting) {
+  const filterBy = state.view === 'combined' ? null : state.view === 'me' ? 'me' : 'partner';
+  const series = computeMonthlySeries(filterBy, 6);
+  const max = Math.max(1, ...series.map(s => s[analyticsMetric]));
+  const totalForMetric = series.reduce((sum, s) => sum + s[analyticsMetric], 0);
+  const avg = series.length ? totalForMetric / series.length : 0;
+
+  const metricColor = { income: 'var(--sage)', expense: 'var(--terracotta)', savings: 'var(--marigold)', debt: '#9098AE' };
+  const metricLabel = { income: 'Income', expense: 'Expenses', savings: 'Savings', debt: 'Debt added' };
+
+  const cats = computeCategoryBreakdownAllTime(filterBy, analyticsMetric === 'debt' ? 'debt' : analyticsMetric);
+  const catMax = cats.length ? cats[0][1] : 1;
+
+  return `
+    <div class="eyebrow">Analytics</div>
+    <h1 class="page-title">Spending over time</h1>
+    <p class="page-sub">Month-wise trend across every cycle, not just the current one.</p>
+
+    <div class="view-switch">
+      <button data-view="me" class="${state.view === 'me' ? 'active' : ''}">${state.me}</button>
+      <button data-view="partner" class="${state.view === 'partner' ? 'active' : ''}" ${waiting ? 'disabled style="opacity:.4"' : ''}>${partnerName || 'Partner'}</button>
+      <button data-view="combined" class="${state.view === 'combined' ? 'active' : ''}">Combined</button>
+    </div>
+
+    <div class="type-tab-row">
+      ${['expense', 'income', 'savings', 'debt'].map(m => `
+        <div class="type-tab ${analyticsMetric === m ? 'active' : ''}" data-metric="${m}">${metricLabel[m]}</div>
+      `).join('')}
+    </div>
+
+    <div class="mini-grid">
+      <div class="mini-card"><div class="lbl">Last 6 months total</div><div class="val">₹${fmtMoney(totalForMetric)}</div></div>
+      <div class="mini-card"><div class="lbl">Monthly average</div><div class="val">₹${fmtMoney(avg)}</div></div>
+    </div>
+
+    <div class="chart-card">
+      <div class="bar-chart">
+        ${series.map(s => {
+          const h = Math.round((s[analyticsMetric] / max) * 100);
+          return `
+            <div class="bar-col">
+              <div class="bar-col-amt">${s[analyticsMetric] > 0 ? '₹' + fmtMoneyShort(s[analyticsMetric]) : ''}</div>
+              <div class="bar-col-track">
+                <div class="bar-col-fill" style="height:${h}%; background:${metricColor[analyticsMetric]};"></div>
+              </div>
+              <div class="bar-col-label">${s.label}</div>
+            </div>
+          `;
+        }).join('')}
+      </div>
+    </div>
+
+    <div class="section-head"><h3>${metricLabel[analyticsMetric]} by category — all time</h3></div>
+    ${cats.length ? cats.map(([name, amt]) => `
+      <div class="cat-row">
+        <div class="cat-row-top"><span class="name">${name}</span><span class="amt">₹${fmtMoney(amt)}</span></div>
+        <div class="bar-track"><div class="bar-fill" style="width:${(amt / catMax) * 100}%; background:${metricColor[analyticsMetric]};"></div></div>
+      </div>
+    `).join('') : `<div class="tx-empty">No ${metricLabel[analyticsMetric].toLowerCase()} entries yet.</div>`}
+  `;
+}
+
+function fmtMoneyShort(n) {
+  if (n >= 100000) return (n / 100000).toFixed(1).replace(/\.0$/, '') + 'L';
+  if (n >= 1000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'k';
+  return fmtMoney(n);
 }
 
 function renderRoomTab(partnerName, waiting) {
@@ -512,6 +746,24 @@ function renderRoomTab(partnerName, waiting) {
     <div class="divider-label">Cycle</div>
     <p class="page-sub" style="margin-bottom:14px;">Starting a new cycle resets the available balance to zero going forward, but keeps all past history saved.</p>
     <button class="btn btn-ghost" id="btnNewCycle">Start new cycle</button>
+
+    <div class="divider-label">Export</div>
+    <p class="page-sub" style="margin-bottom:14px;">Download a cycle as a spreadsheet (.csv) — opens directly in Excel, Google Sheets, or Numbers. Includes both your entries and your partner's, plus the combined totals.</p>
+    ${listAllCycles().map((c, i) => {
+      const label = new Date(c.startedAt).toLocaleDateString("en-IN", { month: "long", year: "numeric" });
+      const count = (c.transactions || []).length;
+      const isCurrent = c.id === state.room.currentCycleId;
+      return `
+        <div class="profile-row">
+          <div class="avatar dim">${i + 1}</div>
+          <div style="flex:1;">
+            <div class="tx-title">${label}${isCurrent ? ' · current' : ''}</div>
+            <div class="tx-sub">${count} ${count === 1 ? 'entry' : 'entries'}</div>
+          </div>
+          <button class="btn btn-sm btn-ghost" data-exportcycle="${c.id}" ${count === 0 ? 'disabled style="opacity:.4"' : ''}>Export</button>
+        </div>
+      `;
+    }).join('')}
 
     <div class="divider-label">Account</div>
     <button class="btn btn-danger-ghost" id="btnLogout">Log out of this device</button>
@@ -704,10 +956,34 @@ function bindAppEvents() {
     };
   }
 
+  document.querySelectorAll('[data-metric]').forEach(el => {
+    el.onclick = () => { analyticsMetric = el.dataset.metric; render(); };
+  });
+
+  document.querySelectorAll('[data-deltx]').forEach(el => {
+    el.onclick = async (e) => {
+      e.stopPropagation();
+      const txId = el.dataset.deltx;
+      const cycleId = el.dataset.delcycle;
+      if (confirm("Delete this entry? This can't be undone.")) {
+        await deleteTransaction(txId, cycleId);
+      }
+    };
+  });
+
   const btnCopy = $("#btnCopyCode");
   if (btnCopy) btnCopy.onclick = () => {
     navigator.clipboard.writeText(state.room.code).then(() => showToast("Code copied"));
   };
+
+  document.querySelectorAll('[data-exportcycle]').forEach(el => {
+    el.onclick = () => {
+      if (el.disabled) return;
+      const cycleId = el.dataset.exportcycle;
+      const cycle = state.room.cycles[cycleId];
+      if (cycle) downloadCycleCsv(cycle, cycleId);
+    };
+  });
 
   const btnNewCycle = $("#btnNewCycle");
   if (btnNewCycle) btnNewCycle.onclick = async () => {
